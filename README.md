@@ -3,8 +3,10 @@ This repository is created to try and help others with premium apps and subscrip
 
 I am using:
 
-*  Python
+*  Python3
 *  Nextcord as discord.py is no longer maintained.
 
 
-When testing the full Workflow and ubscribing to the bot you will have to wait a month for it to be deleted when cancelling the subscription!.
+** When testing the full Workflow and ubscribing to the bot you will have to wait a month for it to be deleted when cancelling the subscription!.**
+
+This is not a copy paste into a script you have the functionmethods ect to make your own now
