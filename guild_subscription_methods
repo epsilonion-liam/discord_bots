@@ -1,0 +1,447 @@
+# SubscriptionCog class from subscriptioncog.py
+
+from nextcord.ext import commands
+import aiohttp
+import logging
+import os
+
+class SubscriptionCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.bot_token = os.getenv('BOT_TOKEN')
+        self.application_id = os.getenv('APPLICATION_ID')
+        self.bot.add_listener(self.on_entitlement_create, 'on_entitlement_create')
+        self.bot.add_listener(self.on_entitlement_delete, 'on_entitlement_delete')
+
+    async def on_entitlement_create(self, entitlement):
+        user_id = entitlement['user_id']
+        sku_id = entitlement['sku_id']
+        start_date = entitlement.get('start_date')
+        end_date = entitlement.get('end_date')
+        expires_at = entitlement.get('expires_at')
+        await self.store_entitlement_event(user_id, sku_id, 'create', start_date, end_date, None, expires_at)
+        logging.info(f"Entitlement created for user {user_id} with SKU {sku_id}")
+
+    async def on_entitlement_delete(self, entitlement):
+        user_id = entitlement['user_id']
+        sku_id = entitlement['sku_id']
+        canceled_at = entitlement.get('canceled_at')
+        await self.store_entitlement_event(user_id, sku_id, 'delete', None, None, canceled_at, None)
+        logging.info(f"Entitlement deleted for user {user_id} with SKU {sku_id}")
+
+    async def store_entitlement_event(self, user_id, sku_id, event_type, start_date=None, end_date=None, canceled_at=None, expires_at=None):
+        try:
+            async with self.bot.db_pool.acquire() as connection:
+                await connection.execute(
+                    "INSERT INTO entitlement_events (user_id, sku_id, event_type, start_date, end_date, canceled_at, expires_at, timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+                    user_id, sku_id, event_type, start_date, end_date, canceled_at, expires_at
+                )
+                logging.info(f"Stored entitlement event for user {user_id}: {event_type} - {sku_id}")
+        except Exception as err:
+            logging.error(f"Error storing entitlement event for user {user_id}: {err}")
+
+    async def get_sku_id(self):
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                'Authorization': f'Bot {self.bot_token}'
+            }
+            async with session.get(f'https://discord.com/api/v9/applications/{self.application_id}/skus', headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logging.info(f"Retrieved SKUs: {data}")
+                    # Filter for the SKU with type: 5 (SUBSCRIPTION)
+                    for sku in data:
+                        if sku['type'] == 5:
+                            return sku['id']
+                    logging.error("No valid subscription SKU found.")
+                    return None
+                else:
+                    logging.error(f"Failed to retrieve SKU ID: {response.status}")
+                    return None
+
+    @commands.command()
+    @commands.is_owner()
+    async def add_test_subscriptions(self, ctx, guild_id: int):
+        sku_id = await self.get_sku_id()
+        if not sku_id:
+            await ctx.send("Failed to retrieve SKU ID.")
+            return
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    'Authorization': f'Bot {self.bot_token}',
+                    'Content-Type': 'application/json'
+                }
+                payload = {
+                    'sku_id': sku_id,
+                    'owner_id': str(guild_id),
+                    'owner_type': 1  # 1 for guild subscription, 2 for user subscription
+                }
+                async with session.post(f'https://discord.com/api/v9/applications/{self.application_id}/entitlements', headers=headers, json=payload) as response:
+                    if response.status == 200:
+                        await ctx.send(f"Test subscription added for guild {guild_id} with SKU {sku_id}.")
+                        # Update the database with the new subscription
+                        await self.bot.db_pool.execute(
+                            "INSERT INTO subscriptions (guild_id, status, expires_at) VALUES ($1, $2, $3) ON CONFLICT (guild_id) DO UPDATE SET status = $2, expires_at = $3",
+                            guild_id, 'active', None  # Set expires_at to None or a specific date if needed
+                        )
+                    else:
+                        data = await response.json()
+                        logging.error(f"Failed to add test subscription: {data}")
+                        await ctx.send(f"Failed to add test subscription: {data}")
+        except Exception as err:
+            logging.error(f"Error adding test subscription for guild {guild_id}: {err}")
+            await ctx.send(f"An error occurred while adding the test subscription: {err}")
+
+    @commands.command()
+    @commands.is_owner()
+    async def delete_test_subscription(self, ctx, guild_id: int):
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    'Authorization': f'Bot {self.bot_token}'
+                }
+                async with session.get(f'https://discord.com/api/v9/applications/{self.application_id}/entitlements', headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        entitlement_id = None
+                        for ent in data:
+                            if int(ent.get('guild_id')) == guild_id:  # Ensure guild_id is an integer
+                                entitlement_id = ent['id']
+                                break
+                        if entitlement_id:
+                            logging.info(f"Deleting entitlement ID {entitlement_id} for guild ID {guild_id}")
+                            async with session.delete(f'https://discord.com/api/v9/applications/{self.application_id}/entitlements/{entitlement_id}', headers=headers) as delete_response:
+                                if delete_response.status == 204:
+                                    await ctx.send(f"Test subscription with entitlement ID {entitlement_id} deleted.")
+                                    # Delete the subscription data from the database
+                                    await self.bot.db_pool.execute("DELETE FROM subscriptions WHERE guild_id = $1", guild_id)
+                                    logging.info(f"Deleted subscription data for guild {guild_id} from the database.")
+                                else:
+                                    delete_data = await delete_response.json()
+                                    logging.error(f"Failed to delete test subscription: {delete_data}")
+                                    await ctx.send(f"Failed to delete test subscription: {delete_data}")
+                        else:
+                            await ctx.send(f"No entitlement found for guild ID {guild_id}.")
+                    else:
+                        data = await response.json()
+                        logging.error(f"Failed to list entitlements: {data}")
+                        await ctx.send(f"Failed to list entitlements: {data}")
+        except Exception as err:
+            logging.error(f"Error deleting test subscription for guild {guild_id}: {err}")
+            await ctx.send(f"An error occurred while deleting the test subscription: {err}")
+
+    async def fetch_entitlement_details(self, entitlement_id):
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                'Authorization': f'Bot {self.bot_token}'
+            }
+            async with session.get(f'https://discord.com/api/v9/applications/{self.application_id}/entitlements/{entitlement_id}', headers=headers) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    logging.error(f"Failed to retrieve entitlement details for {entitlement_id}: {response.status}")
+                    return None
+
+    @commands.command()
+    @commands.is_owner()
+    async def list_entitlements(self, ctx):
+        """List all entitlements for the application."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    'Authorization': f'Bot {self.bot_token}'
+                }
+                async with session.get(f'https://discord.com/api/v9/applications/{self.application_id}/entitlements', headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        entitlements = []
+                        for ent in data:
+                            details = await self.fetch_entitlement_details(ent['id'])
+                            if details:
+                                entitlements.append(f"ID: {ent['id']}, SKU: {ent['sku_id']}, User: {ent.get('user_id', 'N/A')}, Guild: {ent.get('guild_id', 'N/A')}, Start Date: {details.get('start_date')}, End Date: {details.get('end_date')}, Expires At: {details.get('expires_at')}, Canceled At: {details.get('canceled_at')}")
+                        await ctx.send(f"Entitlements:\n" + "\n".join(entitlements))
+                    else:
+                        data = await response.json()
+                        await ctx.send(f"Failed to list entitlements: {data}")
+        except Exception as err:
+            logging.error(f"Error listing entitlements: {err}")
+            await ctx.send(f"An error occurred while listing the entitlements: {err}")
+
+def setup(bot):
+    bot.add_cog(SubscriptionCog(bot))
+    logging.info("SubscriptionCog loaded.")
+
+# Subscription-related functions and event handlers from servercompanion.py
+
+import nextcord
+from nextcord.ext import commands
+import aiohttp
+import logging
+import os
+
+# Function to check if a guild has a premium subscription
+async def has_premium_subscription(guild_id):
+    try:
+        async with bot.db_pool.acquire() as connection:
+            result = await connection.fetchrow("SELECT * FROM subscriptions WHERE guild_id = $1 AND status = 'active'", guild_id)
+            return result is not None
+    except Exception as err:
+        logging.error(f"Error checking premium subscription for guild {guild_id}: {err}")
+        return False
+
+# Add the function to the bot instance
+bot.has_premium_subscription = has_premium_subscription
+
+# Function to update subscription status in the database and store event
+async def handle_subscription_event(guild_id, status, event_type, start_date=None, end_date=None, canceled_at=None, expires_at=None):
+    try:
+        async with bot.db_pool.acquire() as connection:
+            await connection.execute(
+                "INSERT INTO subscriptions (guild_id, status, expires_at) VALUES ($1, $2, $3) ON CONFLICT (guild_id) DO UPDATE SET status = $2, expires_at = $3",
+                guild_id, status, expires_at
+            )
+            await connection.execute(
+                "INSERT INTO subscription_events (guild_id, status, event_type, start_date, end_date, canceled_at, expires_at, timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+                guild_id, status, event_type, start_date, end_date, canceled_at, expires_at
+            )
+            logging.info(f"Handled subscription event for guild {guild_id}: {event_type} - {status}")
+    except Exception as err:
+        logging.error(f"Error handling subscription event for guild {guild_id}: {err}")
+
+# Function to retrieve application ID and SKU
+async def get_app_id_and_sku():
+    async with aiohttp.ClientSession() as session:
+        headers = {
+            'Authorization': f'Bot {BOT_TOKEN}'
+        }
+        async with session.get(f'https://discord.com/api/v9/applications/{APPLICATION_ID}/skus', headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                app_id = data[0]['application_id']
+                sku = data[0]['id']
+                return app_id, sku
+            else:
+                logging.error(f"Failed to retrieve application ID and SKU: {response.status}")
+                return None, None
+
+# Function to load premium cogs for a guild
+async def load_premium_cogs_for_guild(guild_id):
+    for filename in os.listdir('./cogs'):
+        if filename.endswith('.py'):
+            extension_name = f'cogs.{filename[:-3]}'
+            try:
+                if await has_premium_subscription(guild_id):
+                    bot.load_extension(extension_name)
+                    logging.info(f"Loaded premium extension: {extension_name} for guild {guild_id}")
+                else:
+                    bot.unload_extension(extension_name)
+                    logging.info(f"Unloaded premium extension: {extension_name} for guild {guild_id}")
+            except commands.ExtensionAlreadyLoaded:
+                pass
+            except commands.ExtensionNotLoaded:
+                pass
+            except Exception as e:
+                logging.error(f"Failed to load/unload premium extension {extension_name} for guild {guild_id}: {e}")
+
+# Event handler for subscription updates
+@bot.event
+async def on_subscription_update(guild_id, status):
+    await handle_subscription_event(guild_id, status, 'update')
+    logging.info(f"Updated subscription status for guild {guild_id} to {status}")
+
+    # Load or unload premium cogs based on subscription status
+    await load_premium_cogs_for_guild(guild_id)
+
+    # Sync commands after loading/unloading extensions
+    try:
+        await bot.sync_all_application_commands()
+        logging.info(f"Synced commands for guild {guild_id}")
+    except Exception as e:
+        logging.error(f"Error syncing commands for guild {guild_id}: {e}")
+
+async def fetch_entitlement_details(entitlement_id):
+    async with aiohttp.ClientSession() as session:
+        headers = {
+            'Authorization': f'Bot {BOT_TOKEN}'
+        }
+        async with session.get(f'https://discord.com/api/v9/applications/{APPLICATION_ID}/entitlements/{entitlement_id}', headers=headers) as response:
+            if response.status == 200:
+                return await response.json()
+            else:
+                logging.error(f"Failed to retrieve entitlement details for {entitlement_id}: {response.status}")
+                return None
+
+async def check_and_store_subscriptions():
+    async with aiohttp.ClientSession() as session:
+        headers = {
+            'Authorization': f'Bot {BOT_TOKEN}'
+        }
+        async with session.get(f'https://discord.com/api/v9/applications/{APPLICATION_ID}/entitlements', headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                async with bot.db_pool.acquire() as connection:
+                    for ent in data:
+                        guild_id = int(ent.get('guild_id'))  # Ensure guild_id is an integer
+                        entitlement_id = ent.get('id')
+                        if guild_id and entitlement_id:
+                            # Fetch detailed entitlement information
+                            details = await fetch_entitlement_details(entitlement_id)
+                            if details:
+                                # Check if the subscription is already in the database
+                                existing_subscription = await connection.fetchrow("SELECT * FROM subscriptions WHERE guild_id = $1", guild_id)
+                                if not existing_subscription:
+                                    # Store the subscription data in the database
+                                    await connection.execute(
+                                        "INSERT INTO subscriptions (guild_id, status, start_date, end_date, canceled_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6)",
+                                        guild_id, 'active', details.get('start_date'), details.get('end_date'), details.get('canceled_at'), details.get('expires_at')
+                                    )
+                                    logging.info(f"Stored subscription for guild {guild_id}")
+                                else:
+                                    # Update the subscription data if necessary
+                                    await connection.execute(
+                                        "UPDATE subscriptions SET status = $2, start_date = $3, end_date = $4, canceled_at = $5, expires_at = $6 WHERE guild_id = $1",
+                                        guild_id, 'active', details.get('start_date'), details.get('end_date'), details.get('canceled_at'), details.get('expires_at')
+                                    )
+                                    logging.info(f"Updated subscription for guild {guild_id}")
+            else:
+                logging.error(f"Failed to retrieve entitlements: {response.status}")
+
+@bot.event
+async def on_ready():
+    try:
+        # Store metadata for all current guilds
+        for guild in bot.guilds:
+            await store_guild_metadata(guild)
+            await load_premium_cogs_for_guild(guild.id)
+        
+        # Check for guilds with active subscriptions and load premium cogs
+        await check_and_store_subscriptions()
+        
+        async with bot.db_pool.acquire() as connection:
+            active_subscriptions = await connection.fetch("SELECT guild_id FROM subscriptions WHERE status = 'active'")
+            for record in active_subscriptions:
+                guild_id = int(record['guild_id'])  # Ensure guild_id is an integer
+                await load_premium_cogs_for_guild(guild_id)
+        
+        await bot.sync_all_application_commands()
+        print(f'Logged in as {bot.user} (ID: {bot.user.id})')
+        logging.info(f'Synced commands for {len(bot.guilds)} guilds.')
+    except Exception as e:
+        logging.error(f"Error syncing commands: {e}")
+    logging.info(f'Logged in as {bot.user}')
+
+# Event handler for subscription creation
+@bot.event
+async def on_subscription_create(subscription):
+    guild_id = subscription.guild_id
+    status = 'active'
+    start_date = subscription.start_date
+    end_date = subscription.end_date
+    expires_at = subscription.current_period_end
+    await handle_subscription_event(guild_id, status, 'create', start_date, end_date, None, expires_at)
+    await on_subscription_update(guild_id, status)
+
+# Event handler for subscription update
+@bot.event
+async def on_subscription_update(subscription):
+    guild_id = subscription.guild_id
+    status = subscription.status
+    start_date = subscription.start_date
+    end_date = subscription.end_date
+    expires_at = subscription.current_period_end
+    await handle_subscription_event(guild_id, status, 'update', start_date, end_date, None, expires_at)
+    await on_subscription_update(guild_id, status)
+
+# Event handler for subscription deletion
+@bot.event
+async def on_subscription_delete(subscription):
+    guild_id = subscription.guild_id
+    status = 'inactive'
+    canceled_at = subscription.canceled_at
+    expires_at = subscription.current_period_end
+    await handle_subscription_event(guild_id, status, 'delete', None, None, canceled_at, expires_at)
+    await on_subscription_update(guild_id, status)
+
+    # Schedule removal of the subscription from the database at the end date
+    async def remove_subscription():
+        await asyncio.sleep((expires_at - datetime.datetime.utcnow()).total_seconds())
+        try:
+            async with bot.db_pool.acquire() as connection:
+                await connection.execute("DELETE FROM subscriptions WHERE guild_id = $1", guild_id)
+            logging.info(f"Removed subscription for guild {guild_id} after expiration.")
+        except Exception as err:
+            logging.error(f"Error removing subscription for guild {guild_id}: {err}")
+
+    bot.loop.create_task(remove_subscription())
+
+
+# Event handler for entitlement update
+@bot.event
+async def on_entitlement_update(entitlement):
+    user_id = entitlement.user_id
+    sku_id = entitlement.sku_id
+    await store_entitlement_event(user_id, sku_id, 'update')
+    logging.info(f"Entitlement updated for user {user_id} with SKU {sku_id}")
+    # Handle entitlement update logic here
+
+# Event handler for entitlement deletion
+@bot.event
+async def on_entitlement_delete(entitlement):
+    user_id = entitlement.user_id
+    sku_id = entitlement.sku_id
+    await store_entitlement_event(user_id, sku_id, 'delete')
+    logging.info(f"Entitlement deleted for user {user_id} with SKU {sku_id}")
+    # Handle entitlement deletion logic here
+
+# Command to add a test subscription
+@bot.command()
+@commands.is_owner()
+async def add_test_subscriptions(ctx, guild_id: int, sku_id: str):
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                'Authorization': f'Bot {BOT_TOKEN}',
+                'Content-Type': 'application/json'
+            }
+            payload = {
+                'sku_id': sku_id,
+                'owner_id': str(guild_id),
+                'owner_type': 1  # 1 for guild subscription, 2 for user subscription
+            }
+            async with session.post(f'https://discord.com/api/v9/applications/{APPLICATION_ID}/entitlements', headers=headers, json=payload) as response:
+                if response.status == 200:
+                    await ctx.send(f"Test subscription added for guild {guild_id} with SKU {sku_id}.")
+                else:
+                    data = await response.json()
+                    await ctx.send(f"Failed to add test subscription: {data}")
+    except Exception as err:
+        logging.error(f"Error adding test subscription for guild {guild_id}: {err}")
+        await ctx.send(f"An error occurred while adding the test subscription: {err}")
+
+# Function to store subscription event data
+async def store_subscription_event(guild_id, status, event_type, start_date=None, end_date=None, canceled_at=None, expires_at=None):
+    try:
+        async with bot.db_pool.acquire() as connection:
+            await connection.execute(
+                "INSERT INTO subscription_events (guild_id, status, event_type, start_date, end_date, canceled_at, expires_at, timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+                guild_id, status, event_type, start_date, end_date, canceled_at, expires_at
+            )
+            logging.info(f"Stored subscription event for guild {guild_id}: {event_type} - {status}")
+    except Exception as err:
+        logging.error(f"Error storing subscription event for guild {guild_id}: {err}")
+
+# Function to store entitlement event data
+async def store_entitlement_event(user_id, sku_id, event_type):
+    try:
+        async with bot.db_pool.acquire() as connection:
+            await connection.execute(
+                "INSERT INTO entitlement_events (user_id, sku_id, event_type, timestamp) VALUES ($1, $2, $3, NOW())",
+                user_id, sku_id, event_type
+            )
+            logging.info(f"Stored entitlement event for user {user_id}: {event_type} - {sku_id}")
+    except Exception as err:
+        logging.error(f"Error storing entitlement event for user {user_id}: {err}")
+
+
